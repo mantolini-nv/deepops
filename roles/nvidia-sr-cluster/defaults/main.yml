@@ -1,0 +1,12 @@
+################################################################################
+# Cluster Configuration
+################################################################################
+sr_cluster_name: sr-cluster1
+
+docker_group_id: 999 # Must match on all nodes
+sr_share_path: '/shared/{{ sr_cluster_name }}'
+
+# Scenario Runner
+sr_tmp_dir: '/tmp/sr' # Location where SR will read and write IO during runtime
+sr_docker_path: SET_PATH_TO_SR_DOCKER_CONTAINER # for example: nvcr.io/drivesim-sdk/<customer>/sr
+sr_default_version: SET_SR_VERSION # for example: 1.1.6

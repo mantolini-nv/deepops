@@ -1,0 +1,237 @@
+---
+
+##########################################################################################
+# Playbook for deployment of slurm cluster to drive NVIDIA DriveSim Scenario Runner jobs
+##########################################################################################
+#
+# IMPORTANT: Please review carefully the installation instructions at docs/slurm-cluster/nv-sr-cluster.md before continuing.
+#
+# This playbook is a modified version of the Slurm playbook with special configuration and additional 
+# wrapper scripts that enable running NVIDIA Scenario Runner jobs on a compatible platform.
+#
+# The command to deploy is typically:
+#    
+#    ansible-playbook -l slurm-cluster playbooks/nvidia-sr-cluster.yml [--tags=tag_name]
+#
+# Tags:
+# - preinstall: Prepare for deployment and establish connectivity across nodes and user access.
+#               IMPORTANT: please review pre-deployment requirements to make sure nodes are
+#                          prepared and users have proper uid/gid and permissions before running.
+#
+# - docker: Install docker-ce on the login node, docker-compose on the constellation nodes,
+#           and make sure docker group matches
+#
+# - nfs: Configures NFS shares to be used for slurm log files and wrapper scripts central location.
+#        The exports are configured in ./config/group_vars/all.yml in the NFS section.
+#
+# - slurm: installs Slurm. Before executing the playbook please make sure to look over the instructions
+#          located in roles/nvidia-sr-cluster/README.md on how to set up the configuration files.
+#
+# - rclone: Install RCLONE and set up the Central Storage location where all the SR logs and artifacts
+#           will be stored. Make sure to review the rclone configuration in ./config/group_vars/all.yml.
+#
+# - scripts: Install wrapper scripts to enable Scenario Runner cluster
+#
+# - utils: optional helper utilities
+#
+#############################################################################################
+
+# Install python required for Ansible
+- include: bootstrap/bootstrap-python.yml
+  tags: preinstall
+
+# Set up passwordless sudo and SSH keys if needed
+- include: bootstrap/bootstrap-ssh.yml
+  tags: preinstall
+- include: bootstrap/bootstrap-sudo.yml
+  tags: preinstall
+
+# Configure hostnames using /etc/hosts (no DNS server)
+# If you have a DNS solution you can skip the playbook below
+- include: generic/hosts.yml
+  tags: preinstall
+
+# Install needed software packages
+# The packages are defined in group_vars as software_extra_packages and software_remove_packages
+- include: generic/software.yml
+  tags: preinstall
+ 
+# Create users
+# Disabled by default. It is expected that users are preconfigured before this deployment.
+# However if you want to deploy local users to all the nodes you can use this playbook.
+# If you turn this on make sure to configure the users in group_vars and that they 
+# all have matching gid/uid.
+#- include: generic/users.yml
+
+
+##########################################
+# Install docker tools
+##########################################
+
+# Install docker-ce on login node
+- include: container/docker.yml
+  tags: docker
+  vars:
+    hostlist: "slurm-master[0]"
+
+
+# Make sure docker group id matches what is expected
+# NOTE: Is important that docker gid matches what is on the Constellation nodes (typically 999)
+#       If this gives error you will need to fix the gid/uid and rerun
+- hosts: slurm-master
+  tags: docker
+  become: yes
+  tasks:
+    - name: Match docker group id
+      group:
+        name: docker
+        state: present
+        gid: "{{ docker_group_id | default(999) }}"
+
+# Install docker compose on Constellation nodes
+- hosts: slurm-node
+  tags: docker
+  become: yes
+  tasks:
+    - name: Install docker compose
+      shell: '{{ item }}'
+      with_items:
+        - 'curl -L "https://github.com/docker/compose/releases/download/1.26.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose'
+        - 'chmod +x /usr/local/bin/docker-compose'
+
+
+##########################################
+# Setup NFS 
+##########################################
+# Create NFS share folder
+# NOTE: This step can be skipped if a $HOME share for users is already configured
+- hosts: all 
+  tags: nfs
+  become: yes
+  tasks:
+    - name: 'Create shared folder'
+      file:
+        path: '{{ sr_share_path }}'
+        state: directory
+        mode: 0777
+
+# Set up NFS filesystem
+- include: generic/nfs-server.yml
+  tags: nfs
+  vars:
+    hostlist: "{{ nfs_server_group | default('slurm-master[0]') }}"
+  when: slurm_enable_nfs_server
+- include: generic/nfs-client.yml
+  tags: nfs
+  vars:
+    hostlist: "{{ nfs_client_group | default('slurm-master[1:],slurm-node') }}"
+  when: slurm_enable_nfs_client_nodes
+
+
+##########################################
+# Install Slurm
+##########################################
+
+# Install Node Health Check
+- include: slurm-cluster/nhc.yml hostlist=slurm-node
+  tags: slurm
+  when: slurm_install_nhc|default(false)
+
+# Install Slurm
+- include: slurm-cluster/slurm.yml
+  tags: slurm
+
+# Install Open OnDemand
+- include: slurm-cluster/open-ondemand.yml
+  tags: slurm
+  when: install_open_ondemand
+
+
+##########################################
+# Install rclone
+##########################################
+# Install rclone on login node
+- hosts: all
+  tags: rclone
+  become: yes
+  roles:
+    - rclone
+
+
+# Create central storage folders (tested with S3 buckets, tasks may need to change slightly for other types of storage)
+- hosts: slurm-master
+  tags: rclone
+  become: yes
+  tasks:
+    - name: Create central storage main folder (or bucket in the case of S3)
+      command: "rclone mkdir {{ sr_cluster_name }}:{{ central_storage_bucket_name }}"
+    - name: Create central storage test spec folder
+      command: "rclone mkdir {{ sr_cluster_name }}:{{ central_storage_bucket_name }}/{{ central_storage_test_spec_folder }}"
+    - name: Create central storage test output folder
+      command: "rclone mkdir {{ sr_cluster_name }}:{{ central_storage_bucket_name }}/{{ central_storage_test_output_folder }}"
+
+
+
+##########################################
+# Prepare HIL node for SR execution 
+##########################################
+
+# First add location of constellation_cluster.env file to environment
+- hosts: all
+  tags: sr-scripts
+  become: yes
+  tasks:
+    - name: Configure SR_CLUSTER_ROOT_DIR env variable
+      lineinfile:
+        dest: "/etc/environment"
+        state: present
+        regexp: "^SR_CLUSTER_ROOT_DIR="
+        line: "SR_CLUSTER_ROOT_DIR={{ sr_share_path }}"
+
+# Copy scripts into shared folder
+- hosts: slurm-master
+  tags: sr-scripts
+  tasks:
+    - name: Create deployment env source file
+      template:
+        src: '../roles/nvidia-sr-cluster/templates/sr_cluster.env'
+        dest: '{{ sr_share_path }}/sr_cluster.env'
+    - name: Copy scripts
+      copy:
+        src: '../roles/nvidia-sr-cluster/scripts/'
+        dest: '{{ sr_share_path }}/scripts/'
+        mode: 0777
+
+# NOTE: Remove "when: False" line below to set nvidia container runtime (if not already set in your platform)
+- hosts: slurm-node 
+  tags: utils
+  become: yes
+  when: False
+  vars:
+    docker_daemon_json:
+      runtimes:
+        nvidia:
+          path: nvidia-container-runtime
+          runtimeArgs: []
+      default-runtime: nvidia
+  tasks:
+    - name: Add NVIDIA Container Runtime repo
+      shell: |
+        curl -s -L https://nvidia.github.io/nvidia-container-runtime/gpgkey | apt-key add - distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+        curl -s -L https://nvidia.github.io/nvidia-container-runtime/$distribution/nvidia-container-runtime.list | tee /etc/apt/sources.list.d/nvidia-container-runtime.list
+        apt-get update
+    - name: Install NVIDIA container runtime
+      apt:
+        name: nvidia-container-runtime
+        state: present
+    - name: set Docker daemon configuration for nvidia container runtime
+      copy:
+        content: "{{ docker_daemon_json | to_nice_json }}"
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: 0644
+    - name: reload Docker
+      service:
+        name: docker
+        state: reloaded
